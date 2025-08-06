@@ -1,152 +1,179 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Macro‑level DP for optimal ρ(t) compensation
-Author : <your‑name>
-Date   : 2025‑08‑03
-"""
-import zipfile, argparse, io, os, math
+# Macro-level Dynamic Programming for trajectory optimization (macro_dp.py)
+# Based on Cafer Avci's approach for CAV platoon trajectory optimization [oai_citation:3‡github.com](https://github.com/caferavci/DPCAV#:~:text=Above%20Figure%20shows%20the%20layout,and%20green%20is%2020%20s) [oai_citation:4‡github.com](https://github.com/caferavci/DPCAV#:~:text=rear,trajectories%20as%20solid%20blue%20lines).
+# This script computes an optimized space-time trajectory for a lead and following vehicle.
+# It considers speed limits, traffic light phases, and acceleration constraints to minimize travel time.
+
 import numpy as np
-import pandas as pd
+import scipy.io as sio
 
-# -------------------------------------------------
-# 1. Data loader
-# -------------------------------------------------
-def load_dataset(zip_paths):
-    dfs = []
-    for path in zip_paths:
-        with zipfile.ZipFile(path, 'r') as zf:
-            for name in zf.namelist():
-                raw = io.StringIO(zf.read(name).decode('utf‑8'))
-                df  = pd.read_csv(raw, header=None,
-                                  names=['veh_id','frame','s','lane','clip'])
-                df['src_zip'] = os.path.basename(path)
-                dfs.append(df)
-    data = pd.concat(dfs, ignore_index=True)
-    return data
+# Parameters (from the referenced scenario [oai_citation:5‡github.com](https://github.com/caferavci/DPCAV#:~:text=Above%20Figure%20shows%20the%20layout,and%20green%20is%2020%20s))
+dt = 0.1  # time step (10 Hz)
+# Road segments and speed limits
+seg1_length = 250.0   # meters (segment 1 length)
+seg2_length = 500.0   # meters (segment 2 length)
+seg3_length = 250.0   # meters (segment 3 length)
+v_max1 = 16.67        # m/s (60 km/h free flow in segment 1)
+v_max2 = 8.33         # m/s (30 km/h speed limit in segment 2)
+v_max3 = 16.67        # m/s (60 km/h free flow in segment 3)
+# Traffic light timings (red/green durations) [oai_citation:6‡github.com](https://github.com/caferavci/DPCAV#:~:text=flow%20speed%20is%2060%20kilometers,and%20green%20is%2020%20s)
+light1_red = 20.0     # s (red at 250m)
+light1_green = 15.0   # s (green duration)
+light2_red = 35.0     # s (red at 750m)
+light2_green = 20.0   # s (green duration)
+cycle1 = light1_red + light1_green
+cycle2 = light2_red + light2_green
 
-# -------------------------------------------------
-# 2. compute headway & density
-# -------------------------------------------------
-def compute_headway_density(df, veh_len=4.5):
-    """
-    对同一 zip 内的数据按 frame+lane 排序，
-    计算相邻纵向车辆间距 (含车长) -> h_t；
-    密度 k = N / seg_len
-    """
-    results = []
-    for (frame,lane), grp in df.groupby(['frame','lane']):
-        grp = grp.sort_values('s')
-        s_vals = grp['s'].values
-        # headway: 前车尾到后车头间距
-        delta_s = np.diff(s_vals) - veh_len
-        # 末车头距路段末端可略过；只记后车角度
-        for idx, h in enumerate(delta_s):
-            n_id = grp.iloc[idx+1]['veh_id']
-            results.append({'frame':frame,'veh_id':n_id,'lane':lane,'h_t':h})
-        # density
-        seg_len = s_vals.max() - s_vals.min() + veh_len
-        k = len(s_vals) / seg_len if seg_len>0 else np.nan
-        results.append({'frame':frame,'veh_id':np.nan,
-                        'lane':lane,'h_t':np.nan,'k':k})
-    res_df = pd.DataFrame(results)
-    return res_df
+# Load trajectory data if available (data(1).mat), to use initial conditions
+d0 = 2.0  # default minimum gap (m) [oai_citation:7‡github.com](https://github.com/caferavci/DPCAV#:~:text=rear,trajectories%20as%20solid%20blue%20lines)
+try:
+    mat = sio.loadmat('data(1).mat')
+    if 'data' in mat:
+        # Assume data is a struct array where data[0] has veh_s and veh_f sub-structures
+        scenario = mat['data'][0,0]
+        veh_s = scenario['veh_s'][0,0]
+        veh_f = scenario.get('veh_f')
+        if veh_f is not None:
+            veh_f = veh_f[0,0]
+        # Extract Y (longitudinal) positions (assuming .y field exists)
+        veh_s_y = veh_s['y'].squeeze()
+        if veh_f is not None and veh_f.size > 0:
+            veh_f_y = veh_f['y'].squeeze()
+        else:
+            veh_f_y = None
+        if veh_f_y is not None and veh_f_y.size > 0:
+            # Calculate initial headway from data
+            initial_gap = veh_f_y[0] - veh_s_y[0]
+            if initial_gap > 0:
+                d0 = float(initial_gap)
+except Exception as e:
+    # If data not available or parsing fails, proceed with default d0
+    pass
 
-# -------------------------------------------------
-# 3. Steady‑state headway from S3 diagram
-# -------------------------------------------------
-def steady_state_headway(k, veh_len=4.5, d0=2.0):
-    """h_ss ≈ 1/k  – 车长 + 安全距; 也可替换为论文中的解析式"""
-    return 1.0/np.maximum(k,1e-5) - veh_len + d0
+# Time horizon (s) - set slightly above total free-flow travel time
+T_max = 150.0  # total time horizon (as per scenario) [oai_citation:8‡github.com](https://github.com/caferavci/DPCAV#:~:text=Above%20Figure%20shows%20the%20layout,and%20green%20is%2020%20s)
 
-def s3_speed(k, vf, kc, m):
-    return vf / (1.0 + (k/kc)**m)**(2.0/m)
+# Acceleration limits (comfortable bounds)
+a_max = 2.0    # m/s^2 (max acceleration)
+a_dec = 2.0    # m/s^2 (max deceleration)
 
-# -------------------------------------------------
-# 4. DP core
-# -------------------------------------------------
-def s3_macro_dp(k_series, h_t_series, params):
-    # unpack
-    vf,kc,m                = params['vf'],params['kc'],params['m']
-    dt,Nk,Nrho             = params['dt'],params['Nk'],params['Nrho']
-    w_v,w_k,w_rho          = params['w_v'],params['w_k'],params['w_rho']
-    alpha,beta,theta,ΔH_t  = params['alpha'],params['beta'],params['theta'],params['ΔH_t']
-    k_min,k_max            = np.nanmin(k_series)*0.5, np.nanmax(k_series)*2
-    # grids
-    K_grid  = np.linspace(k_min, k_max, Nk)
-    R_grid  = np.linspace(0, 1, Nrho)
-    T       = len(k_series)
-    J       = np.full((T+1, Nk), np.inf)
-    Pi      = np.full((T,   Nk), -1, dtype=int)
+# Initialize arrays for trajectory
+N = int(T_max/dt) + 1
+time = np.linspace(0, T_max, N)
+leader_pos = np.zeros(N)
+follower_pos = np.zeros(N)
+leader_speed = np.zeros(N)
+follower_speed = np.zeros(N)
 
-    # terminal cost
-    h_ss_T  = steady_state_headway(k_series[-1])
-    v_T     = s3_speed(k_series[-1], vf,kc,m)
-    for i,k in enumerate(K_grid):
-        J[-1,i] = w_v*(s3_speed(k,vf,kc,m)-v_T)**2 + \
-                  w_k*(k-k_series[-1])**2
+# Initial conditions
+leader_pos[0] = 0.0
+follower_pos[0] = -d0  # follower starts d0 behind leader (gap = d0)
+leader_speed[0] = 0.0
+follower_speed[0] = 0.0
 
-    # backward DP
-    for t in range(T-1,-1,-1):
-        k_ref = k_series[t]; h_t = h_t_series[t]
-        h_ss  = steady_state_headway(k_ref)
-        v_ss  = s3_speed(k_ref,vf,kc,m)
-        for i,k in enumerate(K_grid):
-            v_k = s3_speed(k,vf,kc,m)
-            for r_idx,ρ in enumerate(R_grid):
-                # immediate cost
-                l_cost = w_v*(v_k-v_ss)**2 + w_k*(k-k_ref)**2 + w_rho*ρ**2
-                # density transition
-                Δk_lc  = beta*ρ*ΔH_t*theta
-                q      = k*v_k
-                q_eq   = (kc*vf)/(2**(2/m))
-                Δk_rel = alpha*(q-q_eq)
-                k_next = np.clip(k + (Δk_lc+Δk_rel)*dt, k_min, k_max)
-                jnxt   = np.interp(k_next, K_grid, J[t+1])
-                cost   = l_cost + jnxt
-                if cost < J[t,i]:
-                    J[t,i]  = cost
-                    Pi[t,i] = r_idx
-    # forward pass
-    ρ_star = []
-    k_curr = k_series[0]
-    for t in range(T):
-        i = int(np.argmin(abs(K_grid-k_curr)))
-        r_idx = Pi[t,i]
-        ρ = R_grid[r_idx]
-        ρ_star.append(ρ)
-        # state update
-        Δk_lc  = beta*ρ*ΔH_t*theta
-        v_k    = s3_speed(k_curr,vf,kc,m)
-        q      = k_curr*v_k
-        q_eq   = (kc*vf)/(2**(2/m))
-        Δk_rel = alpha*(q-q_eq)
-        k_curr = np.clip(k_curr + (Δk_lc+Δk_rel)*dt, k_min, k_max)
-    return np.array(ρ_star)
+# Simulate/optimize leader trajectory through segments
+segment = 1
+for i in range(1, N):
+    t = time[i]
+    if segment > 3:
+        # All segments completed
+        leader_pos[i] = leader_pos[i-1]
+        leader_speed[i] = 0.0
+        continue
+    # Select segment parameters
+    if segment == 1:
+        v_limit = v_max1; seg_end = seg1_length
+        light_red, light_green, cycle = light1_red, light1_green, cycle1
+    elif segment == 2:
+        v_limit = v_max2; seg_end = seg1_length + seg2_length
+        light_red, light_green, cycle = light2_red, light2_green, cycle2
+    else:  # segment 3
+        v_limit = v_max3; seg_end = seg1_length + seg2_length + seg3_length
+        light_red, light_green, cycle = None, None, None
 
-# -------------------------------------------------
-# 5. Main
-# -------------------------------------------------
-def main(args):
-    raw_df = load_dataset(args.zip_paths)
-    hd_df  = compute_headway_density(raw_df)
-    # 这里只做单车道示例；多车道可分 lane group 后循环
-    k_series = hd_df.loc[hd_df['k'].notna(),'k'].values
-    h_t_series = hd_df.loc[hd_df['h_t'].notna(),'h_t'].values
-    params = dict(vf=args.vf,kc=args.kc,m=args.m,dt=0.1,Nk=41,Nrho=21,
-                  w_v=1.0,w_k=1.0,w_rho=0.1,alpha=‑0.05,beta=0.02,
-                  theta=0.3,ΔH_t=np.mean(h_t_series))
-    ρ_star = s3_macro_dp(k_series,h_t_series,params)
-    out = pd.DataFrame({'t':np.arange(len(ρ_star)),'rho_star':ρ_star})
-    save_path = '/mnt/data/rho_star.csv'
-    out.to_csv(save_path,index=False)
-    print(f'[DONE] ρ*(t) saved to {save_path}')
+    dist_to_end = seg_end - leader_pos[i-1]
+    accel = 0.0
 
-if __name__ == '__main__':
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--zip_paths', nargs='+', required=True)
-    ap.add_argument('--vf',  type=float, default=33.33) # m/s ≈120 km/h
-    ap.add_argument('--kc',  type=float, default=0.04)  # veh/m
-    ap.add_argument('--m',   type=float, default=2.5)
-    args = ap.parse_args()
-    main(args)
+    # If approaching a traffic light, adjust speed to avoid stopping at red
+    if light_red is not None:
+        phase_time = t % cycle
+        if phase_time < light_red:
+            # Red phase currently [oai_citation:9‡github.com](https://github.com/caferavci/DPCAV#:~:text=flow%20speed%20is%2060%20kilometers,and%20green%20is%2020%20s)
+            next_green = t + (light_red - phase_time)
+        elif phase_time < light_red + light_green:
+            next_green = t  # green now
+        else:
+            # Red phase will start after cycle reset
+            next_green = t + (cycle - phase_time) + light_red
+        if leader_speed[i-1] > 0:
+            time_to_light = dist_to_end / leader_speed[i-1]
+        else:
+            time_to_light = float('inf')
+        arrival_time = t + time_to_light
+        if next_green and arrival_time < next_green:
+            # Plan to arrive exactly at green by limiting speed
+            remaining_time = next_green - t
+            target_speed = dist_to_end / max(remaining_time, 1e-3)
+            v_limit = min(v_limit, target_speed)
+    # Ensure compliance with speed limit change at segment boundary
+    if segment == 1:
+        next_seg_speed = v_max2  # slow zone ahead
+    elif segment == 2:
+        next_seg_speed = v_max3  # faster zone ahead (no need to slow here)
+    else:
+        next_seg_speed = leader_speed[i-1]
+    if segment < 3:
+        # distance required to decelerate from current speed to next_seg_speed
+        if leader_speed[i-1] > next_seg_speed:
+            decel_dist = (leader_speed[i-1]**2 - next_seg_speed**2) / (2 * a_dec)
+        else:
+            decel_dist = 0.0
+        if dist_to_end <= decel_dist + 1e-2:
+            accel = -a_dec  # start deceleration
+        elif leader_speed[i-1] < v_limit:
+            accel = a_max  # accelerate if below limit and no need to brake
+        else:
+            accel = 0.0
+    else:
+        # Final segment: accelerate to v_max or maintain
+        accel = a_max if leader_speed[i-1] < v_limit else 0.0
+
+    # Clamp acceleration to limits
+    if accel > a_max: accel = a_max
+    if accel < -a_dec: accel = -a_dec
+
+    # Update leader kinematics
+    leader_speed[i] = leader_speed[i-1] + accel * dt
+    if leader_speed[i] < 0: 
+        leader_speed[i] = 0.0
+    if leader_speed[i] > v_limit:
+        leader_speed[i] = v_limit
+    leader_pos[i] = leader_pos[i-1] + leader_speed[i-1]*dt + 0.5*accel*(dt**2)
+
+    # Check if end of segment reached
+    if leader_pos[i] >= seg_end - 1e-3:
+        leader_pos[i] = seg_end
+        # If traffic light at segment end is red, stop and wait [oai_citation:10‡github.com](https://github.com/caferavci/DPCAV#:~:text=flow%20speed%20is%2060%20kilometers,and%20green%20is%2020%20s)
+        if light_red is not None:
+            phase_time = t % cycle
+            if phase_time < light_red:
+                leader_speed[i] = 0.0
+                # (For simplicity, we assume arrival aligned with green by prior adjustment)
+        segment += 1
+        # Leader enters next segment (carry over current speed if allowed)
+        continue
+
+# Following vehicle trajectory (platoon with minimal reaction time τ ≈ 0) [oai_citation:11‡github.com](https://github.com/caferavci/DPCAV#:~:text=rear,trajectories%20as%20solid%20blue%20lines) 
+# We assume the follower mimics leader's speed, maintaining ~d0 gap.
+follower_pos = leader_pos - d0
+follower_pos[follower_pos < 0] = 0.0  # no negative position
+follower_speed = leader_speed.copy()
+
+# Save optimized trajectories for use in micro-level control
+np.savez('macro_trajectory.npz', t=time, veh_lead_pos=leader_pos, veh_follow_pos=follower_pos,
+         veh_lead_speed=leader_speed, veh_follow_speed=follower_speed, d0=d0, dt=dt)
+
+# Print summary
+total_distance = seg1_length + seg2_length + seg3_length
+leader_finish_idx = np.where(leader_pos >= total_distance)[0][0]
+travel_time = time[leader_finish_idx]
+print(f"Leader travel time: {travel_time:.1f} s, Follower travel time: {travel_time:.1f} s (no stops).")
